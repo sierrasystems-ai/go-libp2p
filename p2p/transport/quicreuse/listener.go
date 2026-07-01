@@ -68,6 +68,11 @@ func newQuicListener(tr RefCountedQUICTransport, quicConfig *quic.Config) (*quic
 			}
 			return nil, fmt.Errorf("no supported protocol found. offered: %+v", info.SupportedProtos)
 		},
+		// ECH (Encrypted Client Hello) decryption happens while processing the
+		// outer ClientHello, before GetConfigForClient is invoked and before the
+		// (encrypted) inner ALPN is known. The stdlib reads the ECH keys from this
+		// base config, so we surface the keys of every registered protocol here.
+		GetEncryptedClientHelloKeys: cl.getEncryptedClientHelloKeys,
 	}
 	quicConf := quicConfig.Clone()
 	quicConf.AllowConnectionWindowIncrease = cl.allowWindowIncrease
@@ -78,6 +83,46 @@ func newQuicListener(tr RefCountedQUICTransport, quicConfig *quic.Config) (*quic
 	cl.l = ln
 	go cl.Run() // This go routine shuts down once the underlying quic.Listener is closed (or returns an error).
 	return cl, nil
+}
+
+// getEncryptedClientHelloKeys returns the ECH keys to use for decrypting an
+// incoming ClientHello. Since the outer ClientHello's ALPN may differ from the
+// encrypted inner one, it first tries to match the offered ALPNs and otherwise
+// falls back to the union of all registered protocols' ECH keys (trial
+// decryption will pick the right one). It returns nil when no protocol has ECH
+// configured, which is equivalent to ECH being disabled.
+func (l *quicListener) getEncryptedClientHelloKeys(info *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+	l.protocolsMu.Lock()
+	defer l.protocolsMu.Unlock()
+
+	for _, proto := range info.SupportedProtos {
+		if entry, ok := l.protocols[proto]; ok {
+			keys, err := echKeysForConfig(entry.tlsConf, info)
+			if err != nil {
+				return nil, err
+			}
+			if len(keys) > 0 {
+				return keys, nil
+			}
+		}
+	}
+
+	var all []tls.EncryptedClientHelloKey
+	for _, entry := range l.protocols {
+		keys, err := echKeysForConfig(entry.tlsConf, info)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, keys...)
+	}
+	return all, nil
+}
+
+func echKeysForConfig(conf *tls.Config, info *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+	if conf.GetEncryptedClientHelloKeys != nil {
+		return conf.GetEncryptedClientHelloKeys(info)
+	}
+	return conf.EncryptedClientHelloKeys, nil
 }
 
 func (l *quicListener) allowWindowIncrease(conn *quic.Conn, delta uint64) bool {
