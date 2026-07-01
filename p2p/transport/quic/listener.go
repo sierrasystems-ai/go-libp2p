@@ -29,7 +29,24 @@ func newListener(ln quicreuse.Listener, t *transport, localPeer peer.ID, key ic.
 	localMultiaddrs := make(map[quic.Version]ma.Multiaddr)
 	for _, addr := range ln.Multiaddrs() {
 		if _, err := addr.ValueForProtocol(ma.P_QUIC_V1); err == nil {
+			// If ECH is enabled and we're advertising it via the multiaddr,
+			// append an /ech component carrying the server's ECHConfigList.
+			if len(t.ech.serverConfigList) > 0 && t.ech.advertiseInMultiaddr {
+				echAddr, err := encapsulateECH(addr, t.ech.serverConfigList)
+				if err != nil {
+					return listener{}, err
+				}
+				addr = echAddr
+			}
 			localMultiaddrs[quic.Version1] = addr
+		}
+	}
+
+	// Publish the ECHConfigList out of band (e.g. to DNS) if a publisher was
+	// configured.
+	if len(t.ech.serverConfigList) > 0 && t.ech.dnsPublisher != nil {
+		if err := t.ech.dnsPublisher(t.ech.serverConfigList); err != nil {
+			return listener{}, err
 		}
 	}
 

@@ -26,6 +26,43 @@ func getQUICMultiaddrCode(addr ma.Multiaddr) int {
 	return 0
 }
 
+func TestQUICECHViaMultiaddr(t *testing.T) {
+	// Server advertises its ECH config by appending an /ech component to its
+	// listen multiaddrs.
+	server, err := libp2p.New(
+		libp2p.QUICReuse(quicreuse.NewConnManager),
+		libp2p.Transport(libp2pquic.NewTransport, libp2pquic.WithServerECH()),
+		libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/quic-v1"),
+	)
+	require.NoError(t, err)
+	defer server.Close()
+
+	addrs := server.Addrs()
+	require.Len(t, addrs, 1)
+	// The advertised address must carry the /ech component.
+	_, err = addrs[0].ValueForProtocol(ma.P_ECH)
+	require.NoError(t, err, "expected server address to advertise an /ech component: %s", addrs[0])
+
+	client, err := libp2p.New(
+		libp2p.Transport(libp2pquic.NewTransport),
+		libp2p.NoListenAddrs,
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Since the only advertised address uses ECH, and a client that sets an
+	// ECHConfigList only completes the handshake if ECH is negotiated, a
+	// successful connection proves ECH was used end-to-end.
+	require.NoError(t, client.Connect(ctx, peer.AddrInfo{ID: server.ID(), Addrs: server.Addrs()}))
+	conns := client.Network().ConnsToPeer(server.ID())
+	require.Len(t, conns, 1)
+	_, err = conns[0].RemoteMultiaddr().ValueForProtocol(ma.P_QUIC_V1)
+	require.NoError(t, err)
+}
+
 func TestQUICAndWebTransport(t *testing.T) {
 	h1, err := libp2p.New(
 		libp2p.QUICReuse(quicreuse.NewConnManager),

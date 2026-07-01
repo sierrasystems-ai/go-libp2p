@@ -55,6 +55,98 @@ type transport struct {
 	listenersMu sync.Mutex
 	// map of UDPAddr as string to a virtualListeners
 	listeners map[string][]*virtualListener
+
+	// ECH (TLS Encrypted Client Hello) configuration.
+	ech echConfig
+}
+
+// echConfig holds the ECH configuration for a transport.
+type echConfig struct {
+	// serverKeys are the ECH keys used by the server. When set, incoming
+	// connections that request ECH are decrypted using these keys.
+	serverKeys []tls.EncryptedClientHelloKey
+	// serverConfigList is the marshalled ECHConfigList derived from serverKeys.
+	// It is the value advertised to clients.
+	serverConfigList []byte
+	// advertiseInMultiaddr controls whether listeners append an /ech component
+	// advertising serverConfigList to their multiaddrs.
+	advertiseInMultiaddr bool
+	// dnsPublisher, if set, is invoked with the ECHConfigList each time a
+	// listener starts, so that the config can be published out of band (e.g. in
+	// a DNS HTTPS/SVCB record).
+	dnsPublisher func(configList []byte) error
+
+	// clientConfigList, if set, is used as a fallback ECHConfigList when dialing
+	// a multiaddr that does not itself carry an /ech component.
+	clientConfigList []byte
+}
+
+// Option customizes the QUIC transport.
+type Option func(*transport) error
+
+// WithServerECH enables TLS Encrypted Client Hello (ECH) on the server side.
+//
+// The provided keys are used to decrypt incoming ClientHellos that use ECH. If
+// no keys are provided, a fresh ECH keypair is generated automatically using
+// [DefaultECHPublicName].
+//
+// By default the server advertises the corresponding ECHConfigList by appending
+// an /ech component to its listen multiaddrs (see
+// [DisableECHMultiaddrAdvertisement]). It can additionally be published via DNS
+// using [WithECHDNSPublisher].
+func WithServerECH(keys ...tls.EncryptedClientHelloKey) Option {
+	return func(t *transport) error {
+		if len(keys) == 0 {
+			key, err := GenerateECHConfig(DefaultECHPublicName)
+			if err != nil {
+				return fmt.Errorf("failed to generate ech config: %w", err)
+			}
+			keys = []tls.EncryptedClientHelloKey{key}
+		}
+		t.ech.serverKeys = keys
+		t.ech.serverConfigList = MarshalECHConfigList(keys...)
+		t.ech.advertiseInMultiaddr = true
+		return nil
+	}
+}
+
+// DisableECHMultiaddrAdvertisement stops the server from appending an /ech
+// component advertising its ECHConfigList to its listen multiaddrs. This is
+// useful when the config is advertised exclusively via DNS (see
+// [WithECHDNSPublisher]).
+func DisableECHMultiaddrAdvertisement() Option {
+	return func(t *transport) error {
+		t.ech.advertiseInMultiaddr = false
+		return nil
+	}
+}
+
+// WithECHDNSPublisher registers a callback that is invoked with the server's
+// ECHConfigList each time a listener starts. The callback is responsible for
+// publishing the config out of band, typically in a DNS HTTPS/SVCB record's
+// ech= parameter. It only has an effect when server ECH is enabled via
+// [WithServerECH].
+func WithECHDNSPublisher(publish func(configList []byte) error) Option {
+	return func(t *transport) error {
+		t.ech.dnsPublisher = publish
+		return nil
+	}
+}
+
+// WithClientECHConfig sets an ECHConfigList to use when dialing.
+//
+// When dialing a multiaddr that already carries an /ech component, the config
+// from the multiaddr takes precedence. This option provides a config for
+// multiaddrs that do not embed one, e.g. when the config was obtained out of
+// band (via DNS or manual configuration).
+func WithClientECHConfig(configList []byte) Option {
+	return func(t *transport) error {
+		if err := validateECHConfigList(configList); err != nil {
+			return fmt.Errorf("invalid client ech config: %w", err)
+		}
+		t.ech.clientConfigList = configList
+		return nil
+	}
 }
 
 var _ tpt.Transport = &transport{}
@@ -70,7 +162,7 @@ type activeHolePunch struct {
 }
 
 // NewTransport creates a new QUIC transport
-func NewTransport(key ic.PrivKey, connManager *quicreuse.ConnManager, psk pnet.PSK, gater connmgr.ConnectionGater, rcmgr network.ResourceManager) (tpt.Transport, error) {
+func NewTransport(key ic.PrivKey, connManager *quicreuse.ConnManager, psk pnet.PSK, gater connmgr.ConnectionGater, rcmgr network.ResourceManager, opts ...Option) (tpt.Transport, error) {
 	if len(psk) > 0 {
 		log.Error("QUIC doesn't support private networks yet.")
 		return nil, errors.New("QUIC doesn't support private networks yet")
@@ -88,7 +180,7 @@ func NewTransport(key ic.PrivKey, connManager *quicreuse.ConnManager, psk pnet.P
 		rcmgr = &network.NullResourceManager{}
 	}
 
-	return &transport{
+	t := &transport{
 		privKey:      key,
 		localPeer:    localPeer,
 		identity:     identity,
@@ -100,7 +192,13 @@ func NewTransport(key ic.PrivKey, connManager *quicreuse.ConnManager, psk pnet.P
 		rnd:          *rand.New(rand.NewSource(time.Now().UnixNano())),
 
 		listeners: make(map[string][]*virtualListener),
-	}, nil
+	}
+	for _, opt := range opts {
+		if err := opt(t); err != nil {
+			return nil, err
+		}
+	}
+	return t, nil
 }
 
 func (t *transport) ListenOrder() int {
@@ -133,9 +231,24 @@ func (t *transport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p pee
 		return nil, err
 	}
 
+	// If the address carries an /ech component, use it to encrypt the
+	// ClientHello. Otherwise fall back to a manually configured ECHConfigList,
+	// if any. The /ech component is stripped before dialing since it is not part
+	// of the network address.
+	dialAddr, echConfigList, err := popECHConfigList(raddr)
+	if err != nil {
+		return nil, err
+	}
+	if echConfigList == nil {
+		echConfigList = t.ech.clientConfigList
+	}
+
 	tlsConf, keyCh := t.identity.ConfigForPeer(p)
+	if echConfigList != nil {
+		tlsConf.EncryptedClientHelloConfigList = echConfigList
+	}
 	ctx = quicreuse.WithAssociation(ctx, t)
-	pconn, err := t.connManager.DialQUIC(ctx, raddr, tlsConf, t.allowWindowIncrease)
+	pconn, err := t.connManager.DialQUIC(ctx, dialAddr, tlsConf, t.allowWindowIncrease)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +277,7 @@ func (t *transport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p pee
 		localMultiaddr:  localMultiaddr,
 		remotePubKey:    remotePubKey,
 		remotePeerID:    p,
-		remoteMultiaddr: raddr,
+		remoteMultiaddr: dialAddr,
 	}
 	if t.gater != nil && !t.gater.InterceptSecured(network.DirOutbound, p, c) {
 		pconn.CloseWithError(quic.ApplicationErrorCode(network.ConnGated), "connection gated")
@@ -273,7 +386,14 @@ loop:
 }
 
 // Don't use mafmt.QUIC as we don't want to dial DNS addresses. Just /ip{4,6}/udp/quic-v1
-var dialMatcher = mafmt.And(mafmt.IP, mafmt.Base(ma.P_UDP), mafmt.Base(ma.P_QUIC_V1))
+// An optional trailing /ech component may carry the server's ECH config.
+var dialMatcher = mafmt.Or(
+	// The variant carrying the /ech component must come first: mafmt.Or returns
+	// on the first partial match, so the more specific pattern has to be tried
+	// before the shorter one that would leave /ech unmatched.
+	mafmt.And(mafmt.IP, mafmt.Base(ma.P_UDP), mafmt.Base(ma.P_QUIC_V1), mafmt.Base(ma.P_ECH)),
+	mafmt.And(mafmt.IP, mafmt.Base(ma.P_UDP), mafmt.Base(ma.P_QUIC_V1)),
+)
 
 // CanDial determines if we can dial to an address
 func (t *transport) CanDial(addr ma.Multiaddr) bool {
@@ -289,7 +409,17 @@ func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 		// the peer ID calculated here, we don't actually receive the peer's public key
 		// from the key chan.
 		conf, _ := t.identity.ConfigForPeer("")
+		if len(t.ech.serverKeys) > 0 {
+			// Allow clients to encrypt their ClientHello using our ECH config.
+			conf.EncryptedClientHelloKeys = t.ech.serverKeys
+		}
 		return conf, nil
+	}
+	if len(t.ech.serverKeys) > 0 {
+		// ECH decryption happens while processing the outer ClientHello, using the
+		// keys on the base config, before GetConfigForClient is invoked. So the
+		// keys must be set here too.
+		tlsConf.EncryptedClientHelloKeys = t.ech.serverKeys
 	}
 	tlsConf.NextProtos = []string{"libp2p"}
 	udpAddr, version, err := quicreuse.FromQuicMultiaddr(addr)
