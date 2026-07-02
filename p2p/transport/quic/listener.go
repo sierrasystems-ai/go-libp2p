@@ -23,40 +23,58 @@ type listener struct {
 	privKey         ic.PrivKey
 	localPeer       peer.ID
 	localMultiaddrs map[quic.Version]ma.Multiaddr
+	// advertisedMultiaddrs contains, per QUIC version, every multiaddr this
+	// listener advertises. When the ECH config is advertised via the multiaddr,
+	// this holds both the plain address (so that peers that don't understand
+	// the /ech protocol can still parse and dial it) and the /ech-suffixed one.
+	advertisedMultiaddrs map[quic.Version][]ma.Multiaddr
 }
 
 func newListener(ln quicreuse.Listener, t *transport, localPeer peer.ID, key ic.PrivKey, rcmgr network.ResourceManager) (listener, error) {
 	localMultiaddrs := make(map[quic.Version]ma.Multiaddr)
+	advertisedMultiaddrs := make(map[quic.Version][]ma.Multiaddr)
 	for _, addr := range ln.Multiaddrs() {
 		if _, err := addr.ValueForProtocol(ma.P_QUIC_V1); err == nil {
+			addrs := []ma.Multiaddr{addr}
 			// If ECH is enabled and we're advertising it via the multiaddr,
-			// append an /ech component carrying the server's ECHConfigList.
-			if len(t.ech.serverConfigList) > 0 && t.ech.advertiseInMultiaddr {
+			// additionally advertise the address with an /ech component carrying
+			// the server's ECHConfigList.
+			if len(t.ech.serverConfigList) > 0 && !t.ech.disableMultiaddrAdvertisement {
 				echAddr, err := encapsulateECH(addr, t.ech.serverConfigList)
 				if err != nil {
 					return listener{}, err
 				}
+				addrs = append(addrs, echAddr)
 				addr = echAddr
 			}
 			localMultiaddrs[quic.Version1] = addr
+			advertisedMultiaddrs[quic.Version1] = addrs
 		}
 	}
 
 	// Publish the ECHConfigList out of band (e.g. to DNS) if a publisher was
-	// configured.
+	// configured. The config list is the same for every listener of this
+	// transport, so publish at most once, and asynchronously: a failed or slow
+	// publish should not prevent the node from listening.
 	if len(t.ech.serverConfigList) > 0 && t.ech.dnsPublisher != nil {
-		if err := t.ech.dnsPublisher(t.ech.serverConfigList); err != nil {
-			return listener{}, err
-		}
+		t.ech.publishOnce.Do(func() {
+			publish, configList := t.ech.dnsPublisher, t.ech.serverConfigList
+			go func() {
+				if err := publish(configList); err != nil {
+					log.Error("failed to publish ech config list", "err", err)
+				}
+			}()
+		})
 	}
 
 	return listener{
-		reuseListener:   ln,
-		transport:       t,
-		rcmgr:           rcmgr,
-		privKey:         key,
-		localPeer:       localPeer,
-		localMultiaddrs: localMultiaddrs,
+		reuseListener:        ln,
+		transport:            t,
+		rcmgr:                rcmgr,
+		privKey:              key,
+		localPeer:            localPeer,
+		localMultiaddrs:      localMultiaddrs,
+		advertisedMultiaddrs: advertisedMultiaddrs,
 	}, nil
 }
 

@@ -29,6 +29,14 @@ func (l *virtualListener) Multiaddr() ma.Multiaddr {
 	return l.listener.localMultiaddrs[l.version]
 }
 
+// Multiaddrs returns every multiaddr this listener advertises. When the ECH
+// config is advertised via the multiaddr, this includes both the plain
+// quic-v1 address and the /ech-suffixed variant. The swarm advertises all of
+// them (see swarm.MultiaddrsListener).
+func (l *virtualListener) Multiaddrs() []ma.Multiaddr {
+	return l.listener.advertisedMultiaddrs[l.version]
+}
+
 func (l *virtualListener) Close() error {
 	l.acceptRunnner.RmAcceptForVersion(l.version, tpt.ErrListenerClosed)
 	return l.t.CloseVirtualListener(l)

@@ -27,8 +27,8 @@ func getQUICMultiaddrCode(addr ma.Multiaddr) int {
 }
 
 func TestQUICECHViaMultiaddr(t *testing.T) {
-	// Server advertises its ECH config by appending an /ech component to its
-	// listen multiaddrs.
+	// Server advertises its ECH config by additionally advertising its listen
+	// multiaddrs with an /ech component appended.
 	server, err := libp2p.New(
 		libp2p.QUICReuse(quicreuse.NewConnManager),
 		libp2p.Transport(libp2pquic.NewTransport, libp2pquic.WithServerECH()),
@@ -37,11 +37,18 @@ func TestQUICECHViaMultiaddr(t *testing.T) {
 	require.NoError(t, err)
 	defer server.Close()
 
-	addrs := server.Addrs()
-	require.Len(t, addrs, 1)
-	// The advertised address must carry the /ech component.
-	_, err = addrs[0].ValueForProtocol(ma.P_ECH)
-	require.NoError(t, err, "expected server address to advertise an /ech component: %s", addrs[0])
+	// Both the plain address (dialable by peers that don't understand /ech)
+	// and the /ech-carrying one must be advertised.
+	var plainAddrs, echAddrs []ma.Multiaddr
+	for _, a := range server.Addrs() {
+		if _, err := a.ValueForProtocol(ma.P_ECH); err == nil {
+			echAddrs = append(echAddrs, a)
+		} else {
+			plainAddrs = append(plainAddrs, a)
+		}
+	}
+	require.Len(t, plainAddrs, 1, "expected a plain address to be advertised: %s", server.Addrs())
+	require.Len(t, echAddrs, 1, "expected an /ech address to be advertised: %s", server.Addrs())
 
 	client, err := libp2p.New(
 		libp2p.Transport(libp2pquic.NewTransport),
@@ -53,10 +60,10 @@ func TestQUICECHViaMultiaddr(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Since the only advertised address uses ECH, and a client that sets an
+	// Connect using only the /ech address. Since a client that sets an
 	// ECHConfigList only completes the handshake if ECH is negotiated, a
 	// successful connection proves ECH was used end-to-end.
-	require.NoError(t, client.Connect(ctx, peer.AddrInfo{ID: server.ID(), Addrs: server.Addrs()}))
+	require.NoError(t, client.Connect(ctx, peer.AddrInfo{ID: server.ID(), Addrs: echAddrs}))
 	conns := client.Network().ConnsToPeer(server.ID())
 	require.Len(t, conns, 1)
 	_, err = conns[0].RemoteMultiaddr().ValueForProtocol(ma.P_QUIC_V1)

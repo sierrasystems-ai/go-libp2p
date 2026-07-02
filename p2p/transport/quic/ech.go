@@ -3,13 +3,16 @@ package libp2pquic
 import (
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
-	"errors"
 	"fmt"
+	"io"
 
+	ic "github.com/libp2p/go-libp2p/core/crypto"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multibase"
 	"golang.org/x/crypto/cryptobyte"
+	"golang.org/x/crypto/hkdf"
 )
 
 // TLS Encrypted Client Hello (ECH) constants.
@@ -21,10 +24,10 @@ const (
 
 	// HPKE identifiers. Go's crypto/tls only supports the
 	// DHKEM(X25519, HKDF-SHA256) KEM and the HKDF-SHA256 KDF on the server side.
-	echKEMX25519HKDFSHA256 = 0x0020
-	echKDFHKDFSHA256       = 0x0001
-	echAEADAES128GCM       = 0x0001
-	echAEADAES256GCM       = 0x0002
+	echKEMX25519HKDFSHA256  = 0x0020
+	echKDFHKDFSHA256        = 0x0001
+	echAEADAES128GCM        = 0x0001
+	echAEADAES256GCM        = 0x0002
 	echAEADChaCha20Poly1305 = 0x0003
 )
 
@@ -35,7 +38,10 @@ const (
 // syntactically valid DNS name.
 const DefaultECHPublicName = "libp2p.local"
 
-// GenerateECHConfig generates a fresh ECH keypair for use by a QUIC server.
+const deterministicECHInfo = "libp2p quic ech key"
+
+// GenerateECHConfig generates a fresh, random ECH keypair for use by a QUIC
+// server.
 //
 // The returned [tls.EncryptedClientHelloKey] contains a marshalled ECHConfig
 // (Config) and its associated HPKE private key (PrivateKey). The Config can be
@@ -43,11 +49,10 @@ const DefaultECHPublicName = "libp2p.local"
 // the key must be kept private and passed to the server via [WithServerECH].
 //
 // publicName is the cover server name embedded in the config. If empty,
-// [DefaultECHPublicName] is used.
+// [DefaultECHPublicName] is used. Note that [WithServerECH] without explicit
+// keys derives a deterministic key from the host's private key instead, so
+// that the advertised config is stable across restarts.
 func GenerateECHConfig(publicName string) (tls.EncryptedClientHelloKey, error) {
-	if publicName == "" {
-		publicName = DefaultECHPublicName
-	}
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return tls.EncryptedClientHelloKey{}, err
@@ -56,7 +61,38 @@ func GenerateECHConfig(publicName string) (tls.EncryptedClientHelloKey, error) {
 	if _, err := rand.Read(id[:]); err != nil {
 		return tls.EncryptedClientHelloKey{}, err
 	}
-	config := marshalECHConfig(id[0], priv.PublicKey().Bytes(), publicName)
+	return newECHKey(id[0], priv, publicName)
+}
+
+// deriveECHConfig deterministically derives an ECH keypair from the given
+// libp2p private key, so that a server advertises the same ECH config across
+// restarts and previously shared multiaddrs remain dialable. This mirrors how
+// the WebTransport transport derives deterministic certificates.
+func deriveECHConfig(key ic.PrivKey, publicName string) (tls.EncryptedClientHelloKey, error) {
+	keyBytes, err := key.Raw()
+	if err != nil {
+		return tls.EncryptedClientHelloKey{}, err
+	}
+	r := hkdf.New(sha256.New, keyBytes, nil, []byte(deterministicECHInfo))
+	seed := make([]byte, 32+1) // X25519 private key material plus a config id byte
+	if _, err := io.ReadFull(r, seed); err != nil {
+		return tls.EncryptedClientHelloKey{}, err
+	}
+	priv, err := ecdh.X25519().NewPrivateKey(seed[:32])
+	if err != nil {
+		return tls.EncryptedClientHelloKey{}, err
+	}
+	return newECHKey(seed[32], priv, publicName)
+}
+
+func newECHKey(id uint8, priv *ecdh.PrivateKey, publicName string) (tls.EncryptedClientHelloKey, error) {
+	if publicName == "" {
+		publicName = DefaultECHPublicName
+	}
+	config, err := marshalECHConfig(id, priv.PublicKey().Bytes(), publicName)
+	if err != nil {
+		return tls.EncryptedClientHelloKey{}, err
+	}
 	return tls.EncryptedClientHelloKey{
 		Config:      config,
 		PrivateKey:  priv.Bytes(),
@@ -66,7 +102,11 @@ func GenerateECHConfig(publicName string) (tls.EncryptedClientHelloKey, error) {
 
 // marshalECHConfig marshals a single ECHConfig entry (without the outer
 // ECHConfigList framing).
-func marshalECHConfig(id uint8, pubKey []byte, publicName string) []byte {
+func marshalECHConfig(id uint8, pubKey []byte, publicName string) ([]byte, error) {
+	// public_name is a uint8-length-prefixed field (public_name<1..255>).
+	if len(publicName) == 0 || len(publicName) > 255 {
+		return nil, fmt.Errorf("ech public name length %d out of range [1, 255]", len(publicName))
+	}
 	b := cryptobyte.NewBuilder(nil)
 	b.AddUint16(echConfigVersion)
 	b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
@@ -86,7 +126,7 @@ func marshalECHConfig(id uint8, pubKey []byte, publicName string) []byte {
 		b.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) { b.AddBytes([]byte(publicName)) })
 		b.AddUint16(0) // no extensions
 	})
-	return b.BytesOrPanic()
+	return b.Bytes()
 }
 
 // MarshalECHConfigList marshals the given ECH keys into an ECHConfigList, the
@@ -100,6 +140,18 @@ func MarshalECHConfigList(keys ...tls.EncryptedClientHelloKey) []byte {
 		}
 	})
 	return b.BytesOrPanic()
+}
+
+// EncapsulateECHConfig returns addr with an /ech component carrying the given
+// ECHConfigList appended. Use it to dial a specific server whose ECH config was
+// obtained out of band (e.g. from a DNS HTTPS/SVCB record): the QUIC transport
+// uses the config embedded in the dialed multiaddr to encrypt the ClientHello
+// of that dial only.
+func EncapsulateECHConfig(addr ma.Multiaddr, configList []byte) (ma.Multiaddr, error) {
+	if err := validateECHConfigList(configList); err != nil {
+		return nil, fmt.Errorf("invalid ech config list: %w", err)
+	}
+	return encapsulateECH(addr, configList)
 }
 
 // echMultiaddrComponent returns the /ech multiaddr component encoding the given
@@ -121,42 +173,34 @@ func encapsulateECH(addr ma.Multiaddr, configList []byte) (ma.Multiaddr, error) 
 	return addr.Encapsulate(comp), nil
 }
 
-// popECHConfigList removes the /ech component (if any) from addr, returning the
-// remaining multiaddr and the decoded ECHConfigList. If addr has no /ech
-// component, it is returned unchanged with a nil config list.
-func popECHConfigList(addr ma.Multiaddr) (ma.Multiaddr, []byte, error) {
-	var (
-		configList []byte
-		found      bool
-		rest       ma.Multiaddr
-	)
-	for _, c := range addr {
-		if c.Protocol().Code == ma.P_ECH {
-			configList = append([]byte(nil), c.RawValue()...)
-			found = true
-			continue
-		}
-		comp := c
-		rest = rest.Encapsulate(&comp)
+// popECHConfigList removes the trailing /ech component (if any) from addr,
+// returning the remaining multiaddr and the raw ECHConfigList. dialMatcher only
+// admits addresses with /ech as the final component, so only the last component
+// is inspected. If addr has no /ech component, it is returned unchanged with a
+// nil config list.
+func popECHConfigList(addr ma.Multiaddr) (ma.Multiaddr, []byte) {
+	rest, c := ma.SplitLast(addr)
+	if c == nil || c.Protocol().Code != ma.P_ECH {
+		return addr, nil
 	}
-	if !found {
-		return addr, nil, nil
-	}
-	if len(configList) == 0 {
-		return rest, nil, errors.New("empty ech config in multiaddr")
-	}
-	return rest, configList, nil
+	return rest, c.RawValue()
 }
 
 // validateECHConfigList performs a lightweight sanity check on an ECHConfigList,
-// verifying the outer length framing.
+// verifying the outer length framing. The TLS stack validates the individual
+// configs.
 func validateECHConfigList(b []byte) error {
+	// An ECHConfigList is a uint16-length-prefixed, non-empty list of ECHConfig
+	// entries, each at least 4 bytes (a uint16 version and a uint16 length).
 	if len(b) < 2 {
 		return fmt.Errorf("ech config list too short")
 	}
 	l := int(b[0])<<8 | int(b[1])
 	if l != len(b)-2 {
 		return fmt.Errorf("ech config list length mismatch: header says %d, have %d", l, len(b)-2)
+	}
+	if l < 4 {
+		return fmt.Errorf("ech config list too short: %d bytes", l)
 	}
 	return nil
 }

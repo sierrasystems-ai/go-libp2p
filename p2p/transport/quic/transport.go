@@ -68,17 +68,17 @@ type echConfig struct {
 	// serverConfigList is the marshalled ECHConfigList derived from serverKeys.
 	// It is the value advertised to clients.
 	serverConfigList []byte
-	// advertiseInMultiaddr controls whether listeners append an /ech component
-	// advertising serverConfigList to their multiaddrs.
-	advertiseInMultiaddr bool
-	// dnsPublisher, if set, is invoked with the ECHConfigList each time a
-	// listener starts, so that the config can be published out of band (e.g. in
-	// a DNS HTTPS/SVCB record).
+	// disableMultiaddrAdvertisement stops listeners from additionally
+	// advertising an /ech component carrying serverConfigList in their
+	// multiaddrs.
+	disableMultiaddrAdvertisement bool
+	// dnsPublisher, if set, is invoked once with the ECHConfigList when the
+	// first listener starts, so that the config can be published out of band
+	// (e.g. in a DNS HTTPS/SVCB record).
 	dnsPublisher func(configList []byte) error
-
-	// clientConfigList, if set, is used as a fallback ECHConfigList when dialing
-	// a multiaddr that does not itself carry an /ech component.
-	clientConfigList []byte
+	// publishOnce guards dnsPublisher: the config list is identical for every
+	// listener of this transport, so it is published only once.
+	publishOnce sync.Once
 }
 
 // Option customizes the QUIC transport.
@@ -87,64 +87,51 @@ type Option func(*transport) error
 // WithServerECH enables TLS Encrypted Client Hello (ECH) on the server side.
 //
 // The provided keys are used to decrypt incoming ClientHellos that use ECH. If
-// no keys are provided, a fresh ECH keypair is generated automatically using
-// [DefaultECHPublicName].
+// no keys are provided, an ECH keypair is derived deterministically from the
+// transport's private key (using [DefaultECHPublicName] as the cover name), so
+// that the advertised config stays stable across restarts and previously
+// shared multiaddrs remain dialable.
 //
-// By default the server advertises the corresponding ECHConfigList by appending
-// an /ech component to its listen multiaddrs (see
-// [DisableECHMultiaddrAdvertisement]). It can additionally be published via DNS
-// using [WithECHDNSPublisher].
+// By default the server advertises the corresponding ECHConfigList by
+// additionally advertising its listen multiaddrs with an /ech component
+// appended (see [DisableECHMultiaddrAdvertisement]). It can also be published
+// via DNS using [WithECHDNSPublisher].
 func WithServerECH(keys ...tls.EncryptedClientHelloKey) Option {
 	return func(t *transport) error {
 		if len(keys) == 0 {
-			key, err := GenerateECHConfig(DefaultECHPublicName)
+			key, err := deriveECHConfig(t.privKey, DefaultECHPublicName)
 			if err != nil {
-				return fmt.Errorf("failed to generate ech config: %w", err)
+				return fmt.Errorf("failed to derive ech config: %w", err)
 			}
 			keys = []tls.EncryptedClientHelloKey{key}
 		}
 		t.ech.serverKeys = keys
 		t.ech.serverConfigList = MarshalECHConfigList(keys...)
-		t.ech.advertiseInMultiaddr = true
 		return nil
 	}
 }
 
-// DisableECHMultiaddrAdvertisement stops the server from appending an /ech
-// component advertising its ECHConfigList to its listen multiaddrs. This is
-// useful when the config is advertised exclusively via DNS (see
-// [WithECHDNSPublisher]).
+// DisableECHMultiaddrAdvertisement stops the server from advertising listen
+// multiaddrs with an /ech component carrying its ECHConfigList. This is useful
+// when the config is advertised exclusively via DNS (see
+// [WithECHDNSPublisher]). The order of this option relative to [WithServerECH]
+// does not matter.
 func DisableECHMultiaddrAdvertisement() Option {
 	return func(t *transport) error {
-		t.ech.advertiseInMultiaddr = false
+		t.ech.disableMultiaddrAdvertisement = true
 		return nil
 	}
 }
 
-// WithECHDNSPublisher registers a callback that is invoked with the server's
-// ECHConfigList each time a listener starts. The callback is responsible for
-// publishing the config out of band, typically in a DNS HTTPS/SVCB record's
-// ech= parameter. It only has an effect when server ECH is enabled via
-// [WithServerECH].
+// WithECHDNSPublisher registers a callback that is invoked once with the
+// server's ECHConfigList when the first listener starts. The callback is
+// responsible for publishing the config out of band, typically in a DNS
+// HTTPS/SVCB record's ech= parameter. It is invoked asynchronously, and a
+// publish failure is logged rather than preventing the node from listening.
+// It only has an effect when server ECH is enabled via [WithServerECH].
 func WithECHDNSPublisher(publish func(configList []byte) error) Option {
 	return func(t *transport) error {
 		t.ech.dnsPublisher = publish
-		return nil
-	}
-}
-
-// WithClientECHConfig sets an ECHConfigList to use when dialing.
-//
-// When dialing a multiaddr that already carries an /ech component, the config
-// from the multiaddr takes precedence. This option provides a config for
-// multiaddrs that do not embed one, e.g. when the config was obtained out of
-// band (via DNS or manual configuration).
-func WithClientECHConfig(configList []byte) Option {
-	return func(t *transport) error {
-		if err := validateECHConfigList(configList); err != nil {
-			return fmt.Errorf("invalid client ech config: %w", err)
-		}
-		t.ech.clientConfigList = configList
 		return nil
 	}
 }
@@ -232,16 +219,11 @@ func (t *transport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p pee
 	}
 
 	// If the address carries an /ech component, use it to encrypt the
-	// ClientHello. Otherwise fall back to a manually configured ECHConfigList,
-	// if any. The /ech component is stripped before dialing since it is not part
-	// of the network address.
-	dialAddr, echConfigList, err := popECHConfigList(raddr)
-	if err != nil {
-		return nil, err
-	}
-	if echConfigList == nil {
-		echConfigList = t.ech.clientConfigList
-	}
+	// ClientHello of this dial. The /ech component is stripped before dialing
+	// since it is not part of the network address. To dial with an ECH config
+	// obtained out of band, attach it to the multiaddr with
+	// [EncapsulateECHConfig].
+	dialAddr, echConfigList := popECHConfigList(raddr)
 
 	tlsConf, keyCh := t.identity.ConfigForPeer(p)
 	if echConfigList != nil {

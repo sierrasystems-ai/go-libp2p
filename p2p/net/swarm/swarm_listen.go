@@ -22,6 +22,25 @@ type OrderedListener interface {
 	ListenOrder() int
 }
 
+// MultiaddrsListener is optionally implemented by listeners that advertise
+// more than one multiaddr for a single listener, e.g. the same socket
+// advertised both with and without a trailing metadata component (such as the
+// QUIC transport's /ech component). The swarm advertises all returned
+// addresses as listen addresses.
+type MultiaddrsListener interface {
+	Multiaddrs() []ma.Multiaddr
+}
+
+// listenerMultiaddrs returns all multiaddrs the given listener advertises.
+func listenerMultiaddrs(l transport.Listener) []ma.Multiaddr {
+	if ml, ok := l.(MultiaddrsListener); ok {
+		if addrs := ml.Multiaddrs(); len(addrs) > 0 {
+			return addrs
+		}
+	}
+	return []ma.Multiaddr{l.Multiaddr()}
+}
+
 // Listen sets up listeners for all of the given addresses.
 // It returns as long as we successfully listen on at least *one* address.
 func (s *Swarm) Listen(addrs ...ma.Multiaddr) error {
@@ -80,7 +99,9 @@ func (s *Swarm) ListenClose(addrs ...ma.Multiaddr) {
 
 	s.listeners.Lock()
 	for l := range s.listeners.m {
-		if !containsMultiaddr(addrs, l.Multiaddr()) {
+		if !slices.ContainsFunc(listenerMultiaddrs(l), func(la ma.Multiaddr) bool {
+			return containsMultiaddr(addrs, la)
+		}) {
 			continue
 		}
 
