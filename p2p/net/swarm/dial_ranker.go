@@ -26,6 +26,8 @@ const (
 	// delay for other transport addresses. This will apply to /webrtc-direct.
 	PublicOtherDelay  = 1 * time.Second
 	PrivateOtherDelay = 100 * time.Millisecond
+
+	echProtocolCode = 9849
 )
 
 // NoDelayDialRanker ranks addresses with no delay. This is useful for simultaneous connect requests.
@@ -242,6 +244,11 @@ func score(a ma.Multiaddr) int {
 	if _, err := a.ValueForProtocol(ma.P_QUIC_V1); err == nil {
 		p, _ := a.ValueForProtocol(ma.P_UDP)
 		pi, _ := strconv.Atoi(p)
+		if isProtocolAddr(a, echProtocolCode) {
+			// Prefer the privacy-preserving address when a peer advertises the
+			// same QUIC endpoint both with and without ECH metadata.
+			pi--
+		}
 		return ip4Weight + pi
 	}
 	if p, err := a.ValueForProtocol(ma.P_TCP); err == nil {

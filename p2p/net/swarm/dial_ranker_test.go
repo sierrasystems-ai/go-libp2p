@@ -73,6 +73,7 @@ func TestNoDelayDialRanker(t *testing.T) {
 
 func TestDelayRankerQUICDelay(t *testing.T) {
 	q1v1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	q1v1ECH := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/ech/uAAT__wAA")
 	wt1 := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
 	q2v1 := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
 	q3v1 := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
@@ -93,6 +94,14 @@ func TestDelayRankerQUICDelay(t *testing.T) {
 				{Addr: q1v1, Delay: 0},
 				{Addr: q2v1, Delay: PublicQUICDelay},
 				{Addr: q3v1, Delay: PublicQUICDelay},
+			},
+		},
+		{
+			name:  "prefer-ech-over-plain-quic",
+			addrs: []ma.Multiaddr{q1v1, q1v1ECH},
+			output: []network.AddrDelay{
+				{Addr: q1v1ECH, Delay: 0},
+				{Addr: q1v1, Delay: PublicQUICDelay},
 			},
 		},
 		{

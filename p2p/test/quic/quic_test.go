@@ -13,6 +13,7 @@ import (
 	webtransport "github.com/libp2p/go-libp2p/p2p/transport/webtransport"
 
 	ma "github.com/multiformats/go-multiaddr"
+	quicgo "github.com/quic-go/quic-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -60,14 +61,16 @@ func TestQUICECHViaMultiaddr(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Connect using only the /ech address. Since a client that sets an
-	// ECHConfigList only completes the handshake if ECH is negotiated, a
-	// successful connection proves ECH was used end-to-end.
-	require.NoError(t, client.Connect(ctx, peer.AddrInfo{ID: server.ID(), Addrs: echAddrs}))
+	// Connect using the server's normal dual advertisement. The dial ranker
+	// must prefer the /ech address while retaining the plain one as fallback.
+	require.NoError(t, client.Connect(ctx, peer.AddrInfo{ID: server.ID(), Addrs: server.Addrs()}))
 	conns := client.Network().ConnsToPeer(server.ID())
 	require.Len(t, conns, 1)
 	_, err = conns[0].RemoteMultiaddr().ValueForProtocol(ma.P_QUIC_V1)
 	require.NoError(t, err)
+	var rawConn *quicgo.Conn
+	require.True(t, conns[0].(interface{ As(any) bool }).As(&rawConn))
+	require.True(t, rawConn.ConnectionState().TLS.ECHAccepted)
 }
 
 func TestQUICAndWebTransport(t *testing.T) {
