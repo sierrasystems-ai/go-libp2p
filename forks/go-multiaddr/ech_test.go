@@ -8,6 +8,13 @@ import (
 )
 
 func TestECHProtocolRoundtrip(t *testing.T) {
+	if P_ECH != 9849 {
+		t.Fatalf("unexpected registered protocol code %d", P_ECH)
+	}
+	if got, want := CodeToVarint(P_ECH), []byte{0xf9, 0x4c}; !bytes.Equal(got, want) {
+		t.Fatalf("unexpected protocol varint %x != %x", got, want)
+	}
+
 	// A minimal, well-formed ECHConfigList: a uint16 length prefix followed by
 	// that many bytes.
 	body := []byte{0xde, 0xad, 0xbe, 0xef}

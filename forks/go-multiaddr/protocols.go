@@ -35,7 +35,7 @@ const (
 	P_P2P_WEBRTC_DIRECT = 276 // Deprecated. use webrtc-direct instead
 	P_TLS               = 448
 	P_SNI               = 449
-	P_ECH               = 467 // TLS Encrypted Client Hello config (ECHConfigList)
+	P_ECH               = 9849 // TLS Encrypted Client Hello config (ECHConfigList)
 	P_NOISE             = 454
 	P_WS                = 477
 	P_WSS               = 478 // deprecated alias for /tls/ws
