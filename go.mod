@@ -6,9 +6,9 @@ retract v0.26.1 // Tag was applied incorrectly due to a bug in the release workf
 
 retract v0.36.0 // Accidentally modified the tag.
 
-// Use a local fork of go-multiaddr that adds the /ech multiaddr protocol used
-// to advertise TLS Encrypted Client Hello (ECH) configs.
-replace github.com/multiformats/go-multiaddr => ./forks/go-multiaddr
+// Use a temporary go-multiaddr fork that adds the /ech protocol used to
+// advertise TLS Encrypted Client Hello (ECH) configs.
+replace github.com/multiformats/go-multiaddr => github.com/sierrasystems-ai/go-multiaddr v0.0.0-20260714033721-7d6b2ed55e07
 
 require (
 	filippo.io/keygen v0.0.0-20260114151900-8e2790ea4c5b
