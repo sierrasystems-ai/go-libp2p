@@ -23,6 +23,8 @@ func echAccepted(t *testing.T, c tpt.CapableConn) bool {
 }
 
 func TestECHConfigMultiaddrRoundtrip(t *testing.T) {
+	require.Equal(t, echProtocolCode, ma.ProtocolWithName("ech").Code)
+
 	key, err := GenerateECHConfig("example.com")
 	require.NoError(t, err)
 	require.NotEmpty(t, key.Config)

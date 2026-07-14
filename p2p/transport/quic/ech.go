@@ -180,7 +180,7 @@ func encapsulateECH(addr ma.Multiaddr, configList []byte) (ma.Multiaddr, error) 
 // nil config list.
 func popECHConfigList(addr ma.Multiaddr) (ma.Multiaddr, []byte) {
 	rest, c := ma.SplitLast(addr)
-	if c == nil || c.Protocol().Code != ma.P_ECH {
+	if c == nil || c.Protocol().Code != echProtocolCode {
 		return addr, nil
 	}
 	return rest, c.RawValue()

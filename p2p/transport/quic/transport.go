@@ -373,7 +373,7 @@ var dialMatcher = mafmt.Or(
 	// The variant carrying the /ech component must come first: mafmt.Or returns
 	// on the first partial match, so the more specific pattern has to be tried
 	// before the shorter one that would leave /ech unmatched.
-	mafmt.And(mafmt.IP, mafmt.Base(ma.P_UDP), mafmt.Base(ma.P_QUIC_V1), mafmt.Base(ma.P_ECH)),
+	mafmt.And(mafmt.IP, mafmt.Base(ma.P_UDP), mafmt.Base(ma.P_QUIC_V1), mafmt.Base(echProtocolCode)),
 	mafmt.And(mafmt.IP, mafmt.Base(ma.P_UDP), mafmt.Base(ma.P_QUIC_V1)),
 )
 
