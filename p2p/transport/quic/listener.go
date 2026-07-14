@@ -45,7 +45,6 @@ func newListener(ln quicreuse.Listener, t *transport, localPeer peer.ID, key ic.
 					return listener{}, err
 				}
 				addrs = append(addrs, echAddr)
-				addr = echAddr
 			}
 			localMultiaddrs[quic.Version1] = addr
 			advertisedMultiaddrs[quic.Version1] = addrs

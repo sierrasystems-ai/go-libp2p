@@ -139,16 +139,18 @@ func TestECHViaMultiaddr(t *testing.T) {
 	ln := runServer(t, serverTransport, "/ip4/127.0.0.1/udp/0/quic-v1")
 	defer ln.Close()
 
-	// The advertised multiaddr must carry the /ech component.
-	require.Contains(t, ln.Multiaddr().String(), "/ech/")
+	// Multiaddr reports the actual local transport address, without metadata.
+	require.NotContains(t, ln.Multiaddr().String(), "/ech/")
 	// The listener must additionally advertise the plain address, so that
 	// peers that don't understand the /ech protocol can still dial.
 	addrs := ln.(interface{ Multiaddrs() []ma.Multiaddr }).Multiaddrs()
 	require.Len(t, addrs, 2)
 	var plain, withECH bool
+	var echAddr ma.Multiaddr
 	for _, a := range addrs {
 		if _, err := a.ValueForProtocol(ma.P_ECH); err == nil {
 			withECH = true
+			echAddr = a
 		} else {
 			plain = true
 		}
@@ -160,7 +162,7 @@ func TestECHViaMultiaddr(t *testing.T) {
 	require.NoError(t, err)
 	defer clientTransport.(io.Closer).Close()
 
-	conn, err := clientTransport.Dial(context.Background(), ln.Multiaddr(), serverID)
+	conn, err := clientTransport.Dial(context.Background(), echAddr, serverID)
 	require.NoError(t, err)
 	defer conn.Close()
 	serverConn, err := ln.Accept()
@@ -170,6 +172,9 @@ func TestECHViaMultiaddr(t *testing.T) {
 	require.True(t, echAccepted(t, conn), "expected ECH to be accepted on the client connection")
 	// The connection's remote multiaddr should not leak the /ech component.
 	require.NotContains(t, conn.RemoteMultiaddr().String(), "/ech/")
+	// The server's local multiaddr describes the transport endpoint, not the
+	// metadata used by this particular client to dial it.
+	require.NotContains(t, serverConn.LocalMultiaddr().String(), "/ech/")
 }
 
 // TestECHViaManualClientConfig verifies that a server advertising its ECH config
