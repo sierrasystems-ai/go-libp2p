@@ -31,13 +31,6 @@ const (
 	echAEADChaCha20Poly1305 = 0x0003
 )
 
-// DefaultECHPublicName is the public (cover) server name used when generating
-// an ECH config without an explicit public name. It is sent in the cleartext
-// outer ClientHello, so it should not leak the real destination. libp2p does
-// not use SNI, so the exact value is not important as long as it is a
-// syntactically valid DNS name.
-const DefaultECHPublicName = "libp2p.local"
-
 const deterministicECHInfo = "libp2p quic ech key"
 
 // GenerateECHConfig generates a fresh, random ECH keypair for use by a QUIC
@@ -48,10 +41,9 @@ const deterministicECHInfo = "libp2p quic ech key"
 // advertised to clients (e.g. via a multiaddr /ech component or via DNS), while
 // the key must be kept private and passed to the server via [WithServerECH].
 //
-// publicName is the cover server name embedded in the config. If empty,
-// [DefaultECHPublicName] is used. Note that [WithServerECH] without explicit
-// keys derives a deterministic key from the host's private key instead, so
-// that the advertised config is stable across restarts.
+// publicName is the operator-selected cover server name embedded in the config.
+// It is visible in ClientHelloOuter and must not identify the protected
+// protocol.
 func GenerateECHConfig(publicName string) (tls.EncryptedClientHelloKey, error) {
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -86,9 +78,6 @@ func deriveECHConfig(key ic.PrivKey, publicName string) (tls.EncryptedClientHell
 }
 
 func newECHKey(id uint8, priv *ecdh.PrivateKey, publicName string) (tls.EncryptedClientHelloKey, error) {
-	if publicName == "" {
-		publicName = DefaultECHPublicName
-	}
 	config, err := marshalECHConfig(id, priv.PublicKey().Bytes(), publicName)
 	if err != nil {
 		return tls.EncryptedClientHelloKey{}, err
@@ -96,7 +85,7 @@ func newECHKey(id uint8, priv *ecdh.PrivateKey, publicName string) (tls.Encrypte
 	return tls.EncryptedClientHelloKey{
 		Config:      config,
 		PrivateKey:  priv.Bytes(),
-		SendAsRetry: true,
+		SendAsRetry: false,
 	}, nil
 }
 

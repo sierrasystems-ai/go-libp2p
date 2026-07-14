@@ -32,7 +32,11 @@ func TestQUICECHViaMultiaddr(t *testing.T) {
 	// multiaddrs with an /ech component appended.
 	server, err := libp2p.New(
 		libp2p.QUICReuse(quicreuse.NewConnManager),
-		libp2p.Transport(libp2pquic.NewTransport, libp2pquic.WithServerECH()),
+		libp2p.Transport(
+			libp2pquic.NewTransport,
+			libp2pquic.WithServerECH(),
+			libp2pquic.WithECHPublicName("cover.example"),
+		),
 		libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/quic-v1"),
 	)
 	require.NoError(t, err)

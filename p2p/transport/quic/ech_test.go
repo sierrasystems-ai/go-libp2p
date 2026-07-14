@@ -56,6 +56,9 @@ func TestECHConfigValidation(t *testing.T) {
 	_, err := EncapsulateECHConfig(ma.StringCast("/ip4/1.2.3.4/udp/1234/quic-v1"), []byte{0x00, 0x00})
 	require.Error(t, err)
 
+	_, err = GenerateECHConfig("")
+	require.ErrorContains(t, err, "public name")
+
 	// A public name longer than 255 bytes returns an error instead of panicking.
 	_, err = GenerateECHConfig(strings.Repeat("a", 300))
 	require.ErrorContains(t, err, "public name")
@@ -67,7 +70,7 @@ func TestECHCanDial(t *testing.T) {
 	require.NoError(t, err)
 	defer tr.(io.Closer).Close()
 
-	echKey, err := GenerateECHConfig("")
+	echKey, err := GenerateECHConfig("cover.example")
 	require.NoError(t, err)
 	withECH, err := EncapsulateECHConfig(ma.StringCast("/ip4/1.2.3.4/udp/1234/quic-v1"), MarshalECHConfigList(echKey))
 	require.NoError(t, err)
@@ -83,23 +86,23 @@ func TestECHDeterministicKeys(t *testing.T) {
 	_, priv := createPeer(t)
 	_, otherPriv := createPeer(t)
 
-	key1, err := deriveECHConfig(priv, DefaultECHPublicName)
+	key1, err := deriveECHConfig(priv, "cover.example")
 	require.NoError(t, err)
-	key2, err := deriveECHConfig(priv, DefaultECHPublicName)
+	key2, err := deriveECHConfig(priv, "cover.example")
 	require.NoError(t, err)
 	require.Equal(t, key1, key2, "same host key must derive the same ECH key")
 
-	otherKey, err := deriveECHConfig(otherPriv, DefaultECHPublicName)
+	otherKey, err := deriveECHConfig(otherPriv, "cover.example")
 	require.NoError(t, err)
 	require.NotEqual(t, key1.Config, otherKey.Config, "different host keys must derive different ECH keys")
 	require.NotEqual(t, key1.PrivateKey, otherKey.PrivateKey)
 
 	// The transport option wires the derived key through to the advertised
 	// config list.
-	tr1, err := NewTransport(priv, newConnManager(t), nil, nil, nil, WithServerECH())
+	tr1, err := NewTransport(priv, newConnManager(t), nil, nil, nil, WithServerECH(), WithECHPublicName("cover.example"))
 	require.NoError(t, err)
 	defer tr1.(io.Closer).Close()
-	tr2, err := NewTransport(priv, newConnManager(t), nil, nil, nil, WithServerECH())
+	tr2, err := NewTransport(priv, newConnManager(t), nil, nil, nil, WithServerECH(), WithECHPublicName("cover.example"))
 	require.NoError(t, err)
 	defer tr2.(io.Closer).Close()
 	require.Equal(t,
@@ -113,8 +116,8 @@ func TestECHDeterministicKeys(t *testing.T) {
 func TestECHOptionOrder(t *testing.T) {
 	_, priv := createPeer(t)
 	for _, opts := range [][]Option{
-		{DisableECHMultiaddrAdvertisement(), WithServerECH()},
-		{WithServerECH(), DisableECHMultiaddrAdvertisement()},
+		{DisableECHMultiaddrAdvertisement(), WithServerECH(), WithECHPublicName("cover.example")},
+		{WithECHPublicName("cover.example"), WithServerECH(), DisableECHMultiaddrAdvertisement()},
 	} {
 		tr, err := NewTransport(priv, newConnManager(t), nil, nil, nil, opts...)
 		require.NoError(t, err)
@@ -125,6 +128,12 @@ func TestECHOptionOrder(t *testing.T) {
 	}
 }
 
+func TestECHDerivedKeyRequiresPublicName(t *testing.T) {
+	_, priv := createPeer(t)
+	_, err := NewTransport(priv, newConnManager(t), nil, nil, nil, WithServerECH())
+	require.ErrorContains(t, err, "WithECHPublicName")
+}
+
 // TestECHViaMultiaddr verifies that a server advertising its ECH config via its
 // listen multiaddr can be dialed with ECH negotiated end-to-end, and that the
 // plain address is advertised alongside the /ech one.
@@ -132,7 +141,7 @@ func TestECHViaMultiaddr(t *testing.T) {
 	serverID, serverKey := createPeer(t)
 	_, clientKey := createPeer(t)
 
-	serverTransport, err := NewTransport(serverKey, newConnManager(t), nil, nil, nil, WithServerECH())
+	serverTransport, err := NewTransport(serverKey, newConnManager(t), nil, nil, nil, WithServerECH(), WithECHPublicName("cover.example"))
 	require.NoError(t, err)
 	defer serverTransport.(io.Closer).Close()
 
@@ -199,6 +208,7 @@ func TestECHViaManualClientConfig(t *testing.T) {
 	)
 	require.NoError(t, err)
 	defer serverTransport.(io.Closer).Close()
+	require.False(t, serverTransport.(*transport).ech.serverKeys[0].SendAsRetry)
 
 	ln := runServer(t, serverTransport, "/ip4/127.0.0.1/udp/0/quic-v1")
 	defer ln.Close()
@@ -240,6 +250,7 @@ func TestECHDNSPublisherFailureDoesNotBreakListen(t *testing.T) {
 	called := make(chan struct{}, 1)
 	serverTransport, err := NewTransport(serverKey, newConnManager(t), nil, nil, nil,
 		WithServerECH(),
+		WithECHPublicName("cover.example"),
 		WithECHDNSPublisher(func([]byte) error {
 			called <- struct{}{}
 			return io.ErrUnexpectedEOF

@@ -62,6 +62,11 @@ type transport struct {
 
 // echConfig holds the ECH configuration for a transport.
 type echConfig struct {
+	// enabled controls whether this transport accepts ECH connections.
+	enabled bool
+	// publicName is the operator-provided cover name used when deriving a
+	// server key from the host identity.
+	publicName string
 	// serverKeys are the ECH keys used by the server. When set, incoming
 	// connections that request ECH are decrypted using these keys.
 	serverKeys []tls.EncryptedClientHelloKey
@@ -87,10 +92,8 @@ type Option func(*transport) error
 // WithServerECH enables TLS Encrypted Client Hello (ECH) on the server side.
 //
 // The provided keys are used to decrypt incoming ClientHellos that use ECH. If
-// no keys are provided, an ECH keypair is derived deterministically from the
-// transport's private key (using [DefaultECHPublicName] as the cover name), so
-// that the advertised config stays stable across restarts and previously
-// shared multiaddrs remain dialable.
+// no keys are provided, [WithECHPublicName] must also be configured; an ECH
+// keypair is then derived deterministically from the transport's private key.
 //
 // By default the server advertises the corresponding ECHConfigList by
 // additionally advertising its listen multiaddrs with an /ech component
@@ -98,17 +101,52 @@ type Option func(*transport) error
 // via DNS using [WithECHDNSPublisher].
 func WithServerECH(keys ...tls.EncryptedClientHelloKey) Option {
 	return func(t *transport) error {
-		if len(keys) == 0 {
-			key, err := deriveECHConfig(t.privKey, DefaultECHPublicName)
-			if err != nil {
-				return fmt.Errorf("failed to derive ech config: %w", err)
-			}
-			keys = []tls.EncryptedClientHelloKey{key}
-		}
-		t.ech.serverKeys = keys
-		t.ech.serverConfigList = MarshalECHConfigList(keys...)
+		t.ech.enabled = true
+		t.ech.serverKeys = append([]tls.EncryptedClientHelloKey(nil), keys...)
 		return nil
 	}
+}
+
+// WithECHPublicName sets the public cover name embedded in automatically
+// derived ECH configs. The name is visible in ClientHelloOuter and therefore
+// must be chosen by the operator; protocol-identifying placeholder names are
+// not safe defaults.
+func WithECHPublicName(publicName string) Option {
+	return func(t *transport) error {
+		if len(publicName) == 0 || len(publicName) > 255 {
+			return fmt.Errorf("ech public name length %d out of range [1, 255]", len(publicName))
+		}
+		t.ech.publicName = publicName
+		return nil
+	}
+}
+
+func (t *transport) configureECH() error {
+	if !t.ech.enabled {
+		return nil
+	}
+
+	keys := append([]tls.EncryptedClientHelloKey(nil), t.ech.serverKeys...)
+	if len(keys) == 0 {
+		if t.ech.publicName == "" {
+			return errors.New("WithServerECH without explicit keys requires WithECHPublicName")
+		}
+		key, err := deriveECHConfig(t.privKey, t.ech.publicName)
+		if err != nil {
+			return fmt.Errorf("failed to derive ech config: %w", err)
+		}
+		keys = []tls.EncryptedClientHelloKey{key}
+	}
+
+	// This transport authenticates peers with libp2p identity certificates,
+	// not WebPKI certificates for the ECH public name. RFC 9849 only permits
+	// retry_configs after the outer handshake authenticates that public name.
+	for i := range keys {
+		keys[i].SendAsRetry = false
+	}
+	t.ech.serverKeys = keys
+	t.ech.serverConfigList = MarshalECHConfigList(keys...)
+	return nil
 }
 
 // DisableECHMultiaddrAdvertisement stops the server from advertising listen
@@ -184,6 +222,9 @@ func NewTransport(key ic.PrivKey, connManager *quicreuse.ConnManager, psk pnet.P
 		if err := opt(t); err != nil {
 			return nil, err
 		}
+	}
+	if err := t.configureECH(); err != nil {
+		return nil, err
 	}
 	return t, nil
 }
