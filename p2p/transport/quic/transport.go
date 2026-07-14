@@ -101,6 +101,8 @@ type echConfig struct {
 	publisherStarted bool
 	// publishedConfig deduplicates publication within a rotation period.
 	publishedConfig string
+	// publishingConfig prevents duplicate concurrent attempts for one config.
+	publishingConfig string
 }
 
 type echRotationState struct {
@@ -224,8 +226,12 @@ func (t *transport) refreshECH() error {
 		t.ech.rotation = state
 		t.ech.rotationInitialized = true
 	}
-	if t.ech.publisherStarted && t.ech.dnsPublisher != nil && t.ech.publishedConfig != string(t.ech.serverConfigList) {
-		t.ech.publishedConfig = string(t.ech.serverConfigList)
+	configKey := string(t.ech.serverConfigList)
+	if t.ech.publisherStarted &&
+		t.ech.dnsPublisher != nil &&
+		t.ech.publishedConfig != configKey &&
+		t.ech.publishingConfig != configKey {
+		t.ech.publishingConfig = configKey
 		publish = t.ech.dnsPublisher
 		configToPublish = append([]byte(nil), t.ech.serverConfigList...)
 	}
@@ -233,7 +239,16 @@ func (t *transport) refreshECH() error {
 
 	if publish != nil {
 		go func() {
-			if err := publish(configToPublish); err != nil {
+			err := publish(configToPublish)
+			t.ech.mu.Lock()
+			if t.ech.publishingConfig == configKey {
+				t.ech.publishingConfig = ""
+			}
+			if err == nil && string(t.ech.serverConfigList) == configKey {
+				t.ech.publishedConfig = configKey
+			}
+			t.ech.mu.Unlock()
+			if err != nil {
 				log.Error("failed to publish ech config list", "err", err)
 			}
 		}()

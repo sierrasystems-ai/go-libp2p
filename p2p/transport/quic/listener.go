@@ -56,12 +56,15 @@ func (l *listener) multiaddrs(version quic.Version) []ma.Multiaddr {
 		return nil
 	}
 	addrs := []ma.Multiaddr{addr}
-	if !l.transport.ech.enabled || l.transport.ech.disableMultiaddrAdvertisement {
+	if !l.transport.ech.enabled {
 		return addrs
 	}
 	configList, err := l.transport.currentECHConfigList()
 	if err != nil {
 		log.Error("failed to refresh ech listen address", "err", err)
+		return addrs
+	}
+	if l.transport.ech.disableMultiaddrAdvertisement {
 		return addrs
 	}
 	echAddr, err := encapsulateECH(addr, configList)

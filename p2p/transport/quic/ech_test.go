@@ -373,18 +373,25 @@ func TestECHViaManualClientConfig(t *testing.T) {
 	require.True(t, echAccepted(t, conn), "expected ECH to be accepted on the client connection")
 }
 
-// TestECHDNSPublisherFailureDoesNotBreakListen verifies that a failing DNS
-// publisher doesn't prevent the node from listening.
-func TestECHDNSPublisherFailureDoesNotBreakListen(t *testing.T) {
+// TestECHDNSPublisherFailureRetries verifies that a transient publisher
+// failure doesn't prevent listening and is retried on the next address refresh.
+func TestECHDNSPublisherFailureRetries(t *testing.T) {
 	_, serverKey := createPeer(t)
 
-	called := make(chan struct{}, 1)
+	results := make(chan error, 2)
+	var calls int
 	serverTransport, err := NewTransport(serverKey, newConnManager(t), nil, nil, nil,
 		WithServerECH(),
 		WithECHPublicName("cover.example"),
+		DisableECHMultiaddrAdvertisement(),
 		WithECHDNSPublisher(func([]byte) error {
-			called <- struct{}{}
-			return io.ErrUnexpectedEOF
+			calls++
+			if calls == 1 {
+				results <- io.ErrUnexpectedEOF
+				return io.ErrUnexpectedEOF
+			}
+			results <- nil
+			return nil
 		}),
 	)
 	require.NoError(t, err)
@@ -393,10 +400,20 @@ func TestECHDNSPublisherFailureDoesNotBreakListen(t *testing.T) {
 	ln := runServer(t, serverTransport, "/ip4/127.0.0.1/udp/0/quic-v1")
 	defer ln.Close()
 	select {
-	case <-called:
+	case err := <-results:
+		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for the DNS publisher to be invoked")
 	}
+	require.Eventually(t, func() bool {
+		_ = ln.(interface{ Multiaddrs() []ma.Multiaddr }).Multiaddrs()
+		select {
+		case err := <-results:
+			return err == nil
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
 }
 
 // TestNoECHByDefault verifies that connections do not negotiate ECH unless it is
