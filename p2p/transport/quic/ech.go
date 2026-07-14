@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 
@@ -56,16 +57,18 @@ func GenerateECHConfig(publicName string) (tls.EncryptedClientHelloKey, error) {
 	return newECHKey(id[0], priv, publicName)
 }
 
-// deriveECHConfig deterministically derives an ECH keypair from the given
-// libp2p private key, so that a server advertises the same ECH config across
-// restarts and previously shared multiaddrs remain dialable. This mirrors how
-// the WebTransport transport derives deterministic certificates.
-func deriveECHConfig(key ic.PrivKey, publicName string) (tls.EncryptedClientHelloKey, error) {
+// deriveECHConfig deterministically derives an ECH keypair for the given
+// rotation period. A server derives the same config across restarts within a
+// period while getting a distinct config when the period changes.
+func deriveECHConfig(key ic.PrivKey, publicName string, period int64) (tls.EncryptedClientHelloKey, error) {
 	keyBytes, err := key.Raw()
 	if err != nil {
 		return tls.EncryptedClientHelloKey{}, err
 	}
-	r := hkdf.New(sha256.New, keyBytes, nil, []byte(deterministicECHInfo))
+	info := make([]byte, len(deterministicECHInfo)+8)
+	copy(info, deterministicECHInfo)
+	binary.BigEndian.PutUint64(info[len(deterministicECHInfo):], uint64(period))
+	r := hkdf.New(sha256.New, keyBytes, nil, info)
 	seed := make([]byte, 32+1) // X25519 private key material plus a config id byte
 	if _, err := io.ReadFull(r, seed); err != nil {
 		return tls.EncryptedClientHelloKey{}, err

@@ -34,7 +34,7 @@ func (l *virtualListener) Multiaddr() ma.Multiaddr {
 // quic-v1 address and the /ech-suffixed variant. The swarm advertises all of
 // them (see swarm.MultiaddrsListener).
 func (l *virtualListener) Multiaddrs() []ma.Multiaddr {
-	return l.listener.advertisedMultiaddrs[l.version]
+	return l.listener.multiaddrs(l.version)
 }
 
 func (l *virtualListener) Close() error {

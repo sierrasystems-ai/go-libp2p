@@ -86,29 +86,141 @@ func TestECHDeterministicKeys(t *testing.T) {
 	_, priv := createPeer(t)
 	_, otherPriv := createPeer(t)
 
-	key1, err := deriveECHConfig(priv, "cover.example")
+	key1, err := deriveECHConfig(priv, "cover.example", 42)
 	require.NoError(t, err)
-	key2, err := deriveECHConfig(priv, "cover.example")
+	key2, err := deriveECHConfig(priv, "cover.example", 42)
 	require.NoError(t, err)
 	require.Equal(t, key1, key2, "same host key must derive the same ECH key")
 
-	otherKey, err := deriveECHConfig(otherPriv, "cover.example")
+	otherKey, err := deriveECHConfig(otherPriv, "cover.example", 42)
 	require.NoError(t, err)
 	require.NotEqual(t, key1.Config, otherKey.Config, "different host keys must derive different ECH keys")
 	require.NotEqual(t, key1.PrivateKey, otherKey.PrivateKey)
+	nextPeriodKey, err := deriveECHConfig(priv, "cover.example", 43)
+	require.NoError(t, err)
+	require.NotEqual(t, key1.Config, nextPeriodKey.Config, "rotation periods must derive different ECH keys")
 
 	// The transport option wires the derived key through to the advertised
 	// config list.
-	tr1, err := NewTransport(priv, newConnManager(t), nil, nil, nil, WithServerECH(), WithECHPublicName("cover.example"))
+	now := time.Date(2026, time.July, 14, 0, 0, 0, 0, time.UTC)
+	tr1, err := NewTransport(priv, newConnManager(t), nil, nil, nil, WithServerECH(), WithECHPublicName("cover.example"), withECHClock(func() time.Time { return now }))
 	require.NoError(t, err)
 	defer tr1.(io.Closer).Close()
-	tr2, err := NewTransport(priv, newConnManager(t), nil, nil, nil, WithServerECH(), WithECHPublicName("cover.example"))
+	tr2, err := NewTransport(priv, newConnManager(t), nil, nil, nil, WithServerECH(), WithECHPublicName("cover.example"), withECHClock(func() time.Time { return now }))
 	require.NoError(t, err)
 	defer tr2.(io.Closer).Close()
+	config1, err := tr1.(*transport).currentECHConfigList()
+	require.NoError(t, err)
+	config2, err := tr2.(*transport).currentECHConfigList()
+	require.NoError(t, err)
 	require.Equal(t,
-		tr1.(*transport).ech.serverConfigList,
-		tr2.(*transport).ech.serverConfigList,
+		config1,
+		config2,
 		"restarted transport must advertise the same ECH config list")
+}
+
+func TestECHManagedKeyRotation(t *testing.T) {
+	_, priv := createPeer(t)
+	now := time.Date(2026, time.January, 15, 0, 0, 0, 0, time.UTC)
+	trRaw, err := NewTransport(
+		priv,
+		newConnManager(t),
+		nil,
+		nil,
+		nil,
+		WithServerECH(),
+		WithECHPublicName("cover.example"),
+		withECHClock(func() time.Time { return now }),
+	)
+	require.NoError(t, err)
+	tr := trRaw.(*transport)
+
+	januaryConfig, err := tr.currentECHConfigList()
+	require.NoError(t, err)
+	januaryKeys, err := tr.currentECHKeys()
+	require.NoError(t, err)
+	require.Len(t, januaryKeys, 1)
+
+	now = time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC)
+	februaryConfig, err := tr.currentECHConfigList()
+	require.NoError(t, err)
+	require.NotEqual(t, januaryConfig, februaryConfig)
+	februaryKeys, err := tr.currentECHKeys()
+	require.NoError(t, err)
+	require.Len(t, februaryKeys, 2)
+	require.Equal(t, januaryKeys[0].Config, februaryKeys[1].Config)
+
+	now = time.Date(2026, time.February, 8, 0, 0, 0, 0, time.UTC)
+	afterOverlapKeys, err := tr.currentECHKeys()
+	require.NoError(t, err)
+	require.Len(t, afterOverlapKeys, 1)
+	require.Equal(t, februaryKeys[0].Config, afterOverlapKeys[0].Config)
+}
+
+func TestECHPreviousConfigAcceptedDuringRotationOverlap(t *testing.T) {
+	serverID, serverKey := createPeer(t)
+	_, clientKey := createPeer(t)
+	now := time.Date(2026, time.January, 15, 0, 0, 0, 0, time.UTC)
+	published := make(chan []byte, 2)
+	receivePublished := func() []byte {
+		select {
+		case config := <-published:
+			return config
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for ECH config publication")
+			return nil
+		}
+	}
+
+	serverTransport, err := NewTransport(
+		serverKey,
+		newConnManager(t),
+		nil,
+		nil,
+		nil,
+		WithServerECH(),
+		WithECHPublicName("cover.example"),
+		withECHClock(func() time.Time { return now }),
+		WithECHDNSPublisher(func(config []byte) error {
+			published <- append([]byte(nil), config...)
+			return nil
+		}),
+	)
+	require.NoError(t, err)
+	defer serverTransport.(io.Closer).Close()
+
+	januaryConfig, err := serverTransport.(*transport).currentECHConfigList()
+	require.NoError(t, err)
+	ln := runServer(t, serverTransport, "/ip4/127.0.0.1/udp/0/quic-v1")
+	defer ln.Close()
+	require.Equal(t, januaryConfig, receivePublished())
+
+	// Rotate to February. The listener must advertise the new config while its
+	// TLS callback retains January's key for the first week.
+	now = time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC)
+	var advertisedConfig []byte
+	for _, addr := range ln.(interface{ Multiaddrs() []ma.Multiaddr }).Multiaddrs() {
+		_, config := popECHConfigList(addr)
+		if config != nil {
+			advertisedConfig = config
+		}
+	}
+	require.NotEmpty(t, advertisedConfig)
+	require.NotEqual(t, januaryConfig, advertisedConfig)
+	require.Equal(t, advertisedConfig, receivePublished())
+
+	clientTransport, err := NewTransport(clientKey, newConnManager(t), nil, nil, nil)
+	require.NoError(t, err)
+	defer clientTransport.(io.Closer).Close()
+	staleAddr, err := EncapsulateECHConfig(ln.Multiaddr(), januaryConfig)
+	require.NoError(t, err)
+	conn, err := clientTransport.Dial(context.Background(), staleAddr, serverID)
+	require.NoError(t, err)
+	defer conn.Close()
+	serverConn, err := ln.Accept()
+	require.NoError(t, err)
+	defer serverConn.Close()
+	require.True(t, echAccepted(t, conn))
 }
 
 // TestECHOptionOrder verifies that DisableECHMultiaddrAdvertisement takes

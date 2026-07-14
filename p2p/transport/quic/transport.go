@@ -62,11 +62,19 @@ type transport struct {
 
 // echConfig holds the ECH configuration for a transport.
 type echConfig struct {
+	mu sync.Mutex
 	// enabled controls whether this transport accepts ECH connections.
 	enabled bool
 	// publicName is the operator-provided cover name used when deriving a
 	// server key from the host identity.
 	publicName string
+	// managedKeys enables deterministic monthly key rotation.
+	managedKeys bool
+	// now is replaceable in tests that exercise rotation boundaries.
+	now func() time.Time
+	// rotation tracks the managed key epoch currently loaded in serverKeys.
+	rotation            echRotationState
+	rotationInitialized bool
 	// serverKeys are the ECH keys used by the server. When set, incoming
 	// connections that request ECH are decrypted using these keys.
 	serverKeys []tls.EncryptedClientHelloKey
@@ -77,13 +85,18 @@ type echConfig struct {
 	// advertising an /ech component carrying serverConfigList in their
 	// multiaddrs.
 	disableMultiaddrAdvertisement bool
-	// dnsPublisher, if set, is invoked once with the ECHConfigList when the
-	// first listener starts, so that the config can be published out of band
-	// (e.g. in a DNS HTTPS/SVCB record).
+	// dnsPublisher, if set, is invoked with the current ECHConfigList when the
+	// first listener starts and whenever managed keys rotate.
 	dnsPublisher func(configList []byte) error
-	// publishOnce guards dnsPublisher: the config list is identical for every
-	// listener of this transport, so it is published only once.
-	publishOnce sync.Once
+	// publisherStarted prevents publication before the first listener starts.
+	publisherStarted bool
+	// publishedConfig deduplicates publication within a rotation period.
+	publishedConfig string
+}
+
+type echRotationState struct {
+	period       int64
+	keepPrevious bool
 }
 
 // Option customizes the QUIC transport.
@@ -121,6 +134,13 @@ func WithECHPublicName(publicName string) Option {
 	}
 }
 
+func withECHClock(now func() time.Time) Option {
+	return func(t *transport) error {
+		t.ech.now = now
+		return nil
+	}
+}
+
 func (t *transport) configureECH() error {
 	if !t.ech.enabled {
 		return nil
@@ -131,11 +151,8 @@ func (t *transport) configureECH() error {
 		if t.ech.publicName == "" {
 			return errors.New("WithServerECH without explicit keys requires WithECHPublicName")
 		}
-		key, err := deriveECHConfig(t.privKey, t.ech.publicName)
-		if err != nil {
-			return fmt.Errorf("failed to derive ech config: %w", err)
-		}
-		keys = []tls.EncryptedClientHelloKey{key}
+		t.ech.managedKeys = true
+		return t.refreshECH()
 	}
 
 	// This transport authenticates peers with libp2p identity certificates,
@@ -147,6 +164,92 @@ func (t *transport) configureECH() error {
 	t.ech.serverKeys = keys
 	t.ech.serverConfigList = MarshalECHConfigList(keys...)
 	return nil
+}
+
+func echRotationForTime(now time.Time) echRotationState {
+	now = now.UTC()
+	period := int64(now.Year())*12 + int64(now.Month()-1)
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	return echRotationState{
+		period:       period,
+		keepPrevious: now.Before(monthStart.Add(7 * 24 * time.Hour)),
+	}
+}
+
+func (t *transport) refreshECH() error {
+	var state echRotationState
+	if t.ech.managedKeys {
+		state = echRotationForTime(t.ech.now())
+	}
+
+	var publish func([]byte) error
+	var configToPublish []byte
+
+	t.ech.mu.Lock()
+	if t.ech.managedKeys && (!t.ech.rotationInitialized || t.ech.rotation != state) {
+		current, err := deriveECHConfig(t.privKey, t.ech.publicName, state.period)
+		if err != nil {
+			t.ech.mu.Unlock()
+			return fmt.Errorf("failed to derive current ech config: %w", err)
+		}
+		keys := []tls.EncryptedClientHelloKey{current}
+		if state.keepPrevious {
+			previous, err := deriveECHConfig(t.privKey, t.ech.publicName, state.period-1)
+			if err != nil {
+				t.ech.mu.Unlock()
+				return fmt.Errorf("failed to derive previous ech config: %w", err)
+			}
+			keys = append(keys, previous)
+		}
+		t.ech.serverKeys = keys
+		// Only advertise the current key. The previous key is retained solely
+		// to decrypt stale client configs during the overlap window.
+		t.ech.serverConfigList = MarshalECHConfigList(current)
+		t.ech.rotation = state
+		t.ech.rotationInitialized = true
+	}
+	if t.ech.publisherStarted && t.ech.dnsPublisher != nil && t.ech.publishedConfig != string(t.ech.serverConfigList) {
+		t.ech.publishedConfig = string(t.ech.serverConfigList)
+		publish = t.ech.dnsPublisher
+		configToPublish = append([]byte(nil), t.ech.serverConfigList...)
+	}
+	t.ech.mu.Unlock()
+
+	if publish != nil {
+		go func() {
+			if err := publish(configToPublish); err != nil {
+				log.Error("failed to publish ech config list", "err", err)
+			}
+		}()
+	}
+	return nil
+}
+
+func (t *transport) currentECHKeys() ([]tls.EncryptedClientHelloKey, error) {
+	if err := t.refreshECH(); err != nil {
+		return nil, err
+	}
+	t.ech.mu.Lock()
+	defer t.ech.mu.Unlock()
+	return append([]tls.EncryptedClientHelloKey(nil), t.ech.serverKeys...), nil
+}
+
+func (t *transport) currentECHConfigList() ([]byte, error) {
+	if err := t.refreshECH(); err != nil {
+		return nil, err
+	}
+	t.ech.mu.Lock()
+	defer t.ech.mu.Unlock()
+	return append([]byte(nil), t.ech.serverConfigList...), nil
+}
+
+func (t *transport) startECHPublisher() {
+	t.ech.mu.Lock()
+	t.ech.publisherStarted = true
+	t.ech.mu.Unlock()
+	if err := t.refreshECH(); err != nil {
+		log.Error("failed to refresh ech config for publication", "err", err)
+	}
 }
 
 // DisableECHMultiaddrAdvertisement stops the server from advertising listen
@@ -161,12 +264,13 @@ func DisableECHMultiaddrAdvertisement() Option {
 	}
 }
 
-// WithECHDNSPublisher registers a callback that is invoked once with the
-// server's ECHConfigList when the first listener starts. The callback is
-// responsible for publishing the config out of band, typically in a DNS
-// HTTPS/SVCB record's ech= parameter. It is invoked asynchronously, and a
-// publish failure is logged rather than preventing the node from listening.
-// It only has an effect when server ECH is enabled via [WithServerECH].
+// WithECHDNSPublisher registers a callback that is invoked with the server's
+// ECHConfigList when the first listener starts and whenever managed keys
+// rotate. The callback is responsible for publishing the config out of band,
+// typically in a DNS HTTPS/SVCB record's ech= parameter. It is invoked
+// asynchronously, and a publish failure is logged rather than preventing the
+// node from listening. It only has an effect when server ECH is enabled via
+// [WithServerECH].
 func WithECHDNSPublisher(publish func(configList []byte) error) Option {
 	return func(t *transport) error {
 		t.ech.dnsPublisher = publish
@@ -215,6 +319,7 @@ func NewTransport(key ic.PrivKey, connManager *quicreuse.ConnManager, psk pnet.P
 		conns:        make(map[*quic.Conn]*conn),
 		holePunching: make(map[holePunchKey]*activeHolePunch),
 		rnd:          *rand.New(rand.NewSource(time.Now().UnixNano())),
+		ech:          echConfig{now: time.Now},
 
 		listeners: make(map[string][]*virtualListener),
 	}
@@ -426,23 +531,26 @@ func (t *transport) CanDial(addr ma.Multiaddr) bool {
 // Listen listens for new QUIC connections on the passed multiaddr.
 func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 	var tlsConf tls.Config
+	getECHKeys := func(*tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+		return t.currentECHKeys()
+	}
 	tlsConf.GetConfigForClient = func(_ *tls.ClientHelloInfo) (*tls.Config, error) {
 		// return a tls.Config that verifies the peer's certificate chain.
 		// Note that since we have no way of associating an incoming QUIC connection with
 		// the peer ID calculated here, we don't actually receive the peer's public key
 		// from the key chan.
 		conf, _ := t.identity.ConfigForPeer("")
-		if len(t.ech.serverKeys) > 0 {
+		if t.ech.enabled {
 			// Allow clients to encrypt their ClientHello using our ECH config.
-			conf.EncryptedClientHelloKeys = t.ech.serverKeys
+			conf.GetEncryptedClientHelloKeys = getECHKeys
 		}
 		return conf, nil
 	}
-	if len(t.ech.serverKeys) > 0 {
+	if t.ech.enabled {
 		// ECH decryption happens while processing the outer ClientHello, using the
 		// keys on the base config, before GetConfigForClient is invoked. So the
 		// keys must be set here too.
-		tlsConf.EncryptedClientHelloKeys = t.ech.serverKeys
+		tlsConf.GetEncryptedClientHelloKeys = getECHKeys
 	}
 	tlsConf.NextProtos = []string{"libp2p"}
 	udpAddr, version, err := quicreuse.FromQuicMultiaddr(addr)
