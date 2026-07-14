@@ -138,7 +138,9 @@ func MarshalECHConfigList(keys ...tls.EncryptedClientHelloKey) []byte {
 // ECHConfigList appended. Use it to dial a specific server whose ECH config was
 // obtained out of band (e.g. from a DNS HTTPS/SVCB record): the QUIC transport
 // uses the config embedded in the dialed multiaddr to encrypt the ClientHello
-// of that dial only.
+// of that dial only. Until Go supports a distinct outer ALPN, dialing the
+// resulting address returns [ErrECHOuterALPNUnsupported] rather than exposing
+// the libp2p ALPN in ClientHelloOuter.
 func EncapsulateECHConfig(addr ma.Multiaddr, configList []byte) (ma.Multiaddr, error) {
 	if err := validateECHConfigList(configList); err != nil {
 		return nil, fmt.Errorf("invalid ech config list: %w", err)

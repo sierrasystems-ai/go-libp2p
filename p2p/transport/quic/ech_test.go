@@ -79,6 +79,25 @@ func TestECHCanDial(t *testing.T) {
 	require.True(t, tr.CanDial(withECH))
 }
 
+func TestECHClientRejectsCleartextOuterALPN(t *testing.T) {
+	serverID, _ := createPeer(t)
+	_, clientPriv := createPeer(t)
+	tr, err := NewTransport(clientPriv, newConnManager(t), nil, nil, nil)
+	require.NoError(t, err)
+	defer tr.(io.Closer).Close()
+
+	echKey, err := GenerateECHConfig("cover.example")
+	require.NoError(t, err)
+	withECH, err := EncapsulateECHConfig(
+		ma.StringCast("/ip4/127.0.0.1/udp/1/quic-v1"),
+		MarshalECHConfigList(echKey),
+	)
+	require.NoError(t, err)
+
+	_, err = tr.Dial(context.Background(), withECH, serverID)
+	require.ErrorIs(t, err, ErrECHOuterALPNUnsupported)
+}
+
 // TestECHDeterministicKeys verifies that WithServerECH without explicit keys
 // derives the same ECH config from the same host key across transport
 // instances (i.e. across restarts), and different configs for different hosts.
@@ -209,7 +228,7 @@ func TestECHPreviousConfigAcceptedDuringRotationOverlap(t *testing.T) {
 	require.NotEqual(t, januaryConfig, advertisedConfig)
 	require.Equal(t, advertisedConfig, receivePublished())
 
-	clientTransport, err := NewTransport(clientKey, newConnManager(t), nil, nil, nil)
+	clientTransport, err := NewTransport(clientKey, newConnManager(t), nil, nil, nil, withInsecureECHClientForTesting())
 	require.NoError(t, err)
 	defer clientTransport.(io.Closer).Close()
 	staleAddr, err := EncapsulateECHConfig(ln.Multiaddr(), januaryConfig)
@@ -279,7 +298,7 @@ func TestECHViaMultiaddr(t *testing.T) {
 	require.True(t, plain, "expected a plain listen address to be advertised")
 	require.True(t, withECH, "expected an /ech listen address to be advertised")
 
-	clientTransport, err := NewTransport(clientKey, newConnManager(t), nil, nil, nil)
+	clientTransport, err := NewTransport(clientKey, newConnManager(t), nil, nil, nil, withInsecureECHClientForTesting())
 	require.NoError(t, err)
 	defer clientTransport.(io.Closer).Close()
 
@@ -335,7 +354,7 @@ func TestECHViaManualClientConfig(t *testing.T) {
 		t.Fatal("timed out waiting for the DNS publisher to be invoked")
 	}
 
-	clientTransport, err := NewTransport(clientKey, newConnManager(t), nil, nil, nil)
+	clientTransport, err := NewTransport(clientKey, newConnManager(t), nil, nil, nil, withInsecureECHClientForTesting())
 	require.NoError(t, err)
 	defer clientTransport.(io.Closer).Close()
 

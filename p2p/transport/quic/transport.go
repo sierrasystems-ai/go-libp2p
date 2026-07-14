@@ -32,6 +32,11 @@ var log = logging.Logger("quic-transport")
 
 var ErrHolePunching = errors.New("hole punching attempted; no active dial")
 
+// ErrECHOuterALPNUnsupported is returned when dialing an /ech address because
+// the Go TLS client cannot currently keep the libp2p ALPN out of
+// ClientHelloOuter. See https://go.dev/issue/71220.
+var ErrECHOuterALPNUnsupported = errors.New("ECH client dialing requires separate outer ALPN support (https://go.dev/issue/71220)")
+
 var HolePunchTimeout = 5 * time.Second
 
 // The Transport implements the tpt.Transport interface for QUIC connections.
@@ -58,6 +63,10 @@ type transport struct {
 
 	// ECH (TLS Encrypted Client Hello) configuration.
 	ech echConfig
+
+	// allowInsecureECHClient is test-only. Production clients must not send
+	// libp2p in cleartext ClientHelloOuter.
+	allowInsecureECHClient bool
 }
 
 // echConfig holds the ECH configuration for a transport.
@@ -137,6 +146,13 @@ func WithECHPublicName(publicName string) Option {
 func withECHClock(now func() time.Time) Option {
 	return func(t *transport) error {
 		t.ech.now = now
+		return nil
+	}
+}
+
+func withInsecureECHClientForTesting() Option {
+	return func(t *transport) error {
+		t.allowInsecureECHClient = true
 		return nil
 	}
 }
@@ -370,6 +386,9 @@ func (t *transport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p pee
 	// obtained out of band, attach it to the multiaddr with
 	// [EncapsulateECHConfig].
 	dialAddr, echConfigList := popECHConfigList(raddr)
+	if echConfigList != nil && !t.allowInsecureECHClient {
+		return nil, ErrECHOuterALPNUnsupported
+	}
 
 	tlsConf, keyCh := t.identity.ConfigForPeer(p)
 	if echConfigList != nil {
